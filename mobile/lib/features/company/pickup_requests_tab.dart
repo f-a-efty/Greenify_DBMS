@@ -43,8 +43,9 @@ class _PickupRequestsTabState extends ConsumerState<PickupRequestsTab> {
         _vehicles = _maps(values[1]);
       });
     } catch (_) {
-      if (mounted)
+      if (mounted) {
         setState(() => _error = 'Could not load company pickup requests.');
+      }
     } finally {
       if (mounted) setState(() => _loading = false);
     }
@@ -58,6 +59,8 @@ class _PickupRequestsTabState extends ConsumerState<PickupRequestsTab> {
   Widget build(BuildContext context) {
     final active =
         _requests.where((request) => request['status'] != 'Completed').toList();
+    final availableVehicles =
+        _vehicles.where((vehicle) => vehicle['status'] == 'Available').length;
     return RefreshIndicator(
       onRefresh: _load,
       child: ListView(
@@ -75,9 +78,14 @@ class _PickupRequestsTabState extends ConsumerState<PickupRequestsTab> {
                           ?.copyWith(fontWeight: FontWeight.w800)),
                   const SizedBox(height: 4),
                   Text(
-                      '${active.length} open requests  ·  ${_vehicles.where((vehicle) => vehicle['status'] == 'Available').length} vehicles available',
+                      '${active.length} open requests  ·  $availableVehicles vehicles available',
                       style: const TextStyle(color: AppTheme.muted)),
                 ])),
+            IconButton(
+              onPressed: _addVehicle,
+              tooltip: 'Add vehicle and driver',
+              icon: const Icon(Icons.add_circle_outline_rounded),
+            ),
             IconButton(
                 onPressed: _load,
                 tooltip: 'Refresh pickup requests',
@@ -126,16 +134,25 @@ class _PickupRequestsTabState extends ConsumerState<PickupRequestsTab> {
           Text(
               '${request['boothCode'] ?? 'Booth'}  ·  ${request['payloadKg'] ?? 0} kg',
               style: const TextStyle(fontWeight: FontWeight.w700)),
+          if (!completed)
+            Text(
+                'Current booth weight: ${((request['currentWeightKg'] as num?)?.toDouble() ?? 0).toStringAsFixed(1)} kg',
+                style: const TextStyle(color: AppTheme.muted, fontSize: 12)),
           const SizedBox(height: 3),
           Text(request['locationAddress']?.toString() ?? '',
               style: const TextStyle(color: AppTheme.muted, fontSize: 12)),
           if (assigned) ...[
             const SizedBox(height: 5),
-            Text('Vehicle  ${request['vehicleNumber'] ?? 'Assigned'}',
+            Text(
+                'Driver: ${request['driverName'] ?? 'Assigned'}  ·  Vehicle: ${request['vehicleNumber'] ?? '—'}',
                 style: const TextStyle(
                     color: AppTheme.primary,
                     fontWeight: FontWeight.w700,
                     fontSize: 12)),
+            Text(
+                'Booth: ${request['boothCode'] ?? '—'}  ·  Assigned: ${_dateTime(request['assignedAt'] ?? request['createdAt'])}',
+                style:
+                    const TextStyle(color: AppTheme.muted, fontSize: 12)),
           ],
           if (!completed) ...[
             const SizedBox(height: 12),
@@ -154,16 +171,16 @@ class _PickupRequestsTabState extends ConsumerState<PickupRequestsTab> {
                         : () => _assign(requestId),
                     icon: const Icon(Icons.local_shipping_outlined),
                     label: const Text('Assign vehicle')),
-              if (assigned)
-                FilledButton.icon(
-                    onPressed: _workingRequest == requestId
-                        ? null
-                        : () => _complete(requestId),
-                    icon: const Icon(Icons.task_alt_rounded),
-                    label: const Text('Complete collection')),
             ]),
           ] else ...[
             const SizedBox(height: 8),
+            if (request['collectedKg'] != null)
+              Text(
+                  'Collected ${((request['collectedKg'] as num).toDouble()).toStringAsFixed(3)} kg',
+                  style: const TextStyle(
+                      color: AppTheme.primary,
+                      fontSize: 12,
+                      fontWeight: FontWeight.w700)),
             Text('Completed ${_date(request['completedAt'])}',
                 style: const TextStyle(
                     color: AppTheme.primary,
@@ -207,11 +224,11 @@ class _PickupRequestsTabState extends ConsumerState<PickupRequestsTab> {
                   leading: const Icon(Icons.local_shipping_outlined,
                       color: AppTheme.primary),
                   title:
-                      Text(vehicle['vehicle_number']?.toString() ?? 'Vehicle'),
+                      Text(vehicle['vehicleNumber']?.toString() ?? 'Vehicle'),
                   subtitle: Text(
-                      '${vehicle['vehicle_type'] ?? ''}  ·  ${vehicle['driver_name'] ?? ''}'),
+                      '${vehicle['vehicleType'] ?? ''}  ·  ${vehicle['driverName'] ?? ''}'),
                   onTap: () => Navigator.pop(
-                      context, (vehicle['vehicle_id'] as num).toInt()),
+                      context, (vehicle['vehicleId'] as num).toInt()),
                 )),
           ])),
     );
@@ -224,29 +241,26 @@ class _PickupRequestsTabState extends ConsumerState<PickupRequestsTab> {
     );
   }
 
-  Future<void> _complete(int requestId) async {
-    final confirmed = await showDialog<bool>(
+  Future<void> _addVehicle() async {
+    final values = await showDialog<Map<String, String>>(
       context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('Complete collection?'),
-        content: const Text(
-            'This will record the collected booth weight and add it to your company history and the admin collections report.'),
-        actions: [
-          TextButton(
-              onPressed: () => Navigator.pop(context, false),
-              child: const Text('Cancel')),
-          FilledButton(
-              onPressed: () => Navigator.pop(context, true),
-              child: const Text('Complete')),
-        ],
-      ),
+      builder: (_) => const _AddCompanyVehicleDialog(),
     );
-    if (confirmed != true) return;
-    await _runAction(
-      requestId,
-      () => _api.completeCompanyPickup(ref.read(authTokenProvider), requestId),
-      'Collection recorded successfully.',
-    );
+    if (values == null) return;
+    try {
+      await _api.createCompanyVehicle(ref.read(authTokenProvider), values);
+      await _load();
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Vehicle and driver saved.')));
+      }
+    } catch (_) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+            content: Text(
+                'Vehicle could not be saved. Check that its number is unique.')));
+      }
+    }
   }
 
   Future<void> _runAction(
@@ -255,14 +269,16 @@ class _PickupRequestsTabState extends ConsumerState<PickupRequestsTab> {
     try {
       await action();
       await _load();
-      if (mounted)
+      if (mounted) {
         ScaffoldMessenger.of(context)
             .showSnackBar(SnackBar(content: Text(success)));
+      }
     } catch (_) {
-      if (mounted)
+      if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
             content:
                 Text('Pickup could not be updated. Refresh and try again.')));
+      }
     } finally {
       if (mounted) setState(() => _workingRequest = null);
     }
@@ -280,6 +296,95 @@ class _PickupRequestsTabState extends ConsumerState<PickupRequestsTab> {
         ? ''
         : DateFormat('MMM d, y').format(parsed.toLocal());
   }
+
+  String _dateTime(dynamic value) {
+    final parsed = DateTime.tryParse(value?.toString() ?? '');
+    return parsed == null
+        ? 'Time unavailable'
+        : DateFormat('MMM d, y · h:mm a').format(parsed.toLocal());
+  }
+}
+
+class _AddCompanyVehicleDialog extends StatefulWidget {
+  const _AddCompanyVehicleDialog();
+
+  @override
+  State<_AddCompanyVehicleDialog> createState() =>
+      _AddCompanyVehicleDialogState();
+}
+
+class _AddCompanyVehicleDialogState extends State<_AddCompanyVehicleDialog> {
+  final _formKey = GlobalKey<FormState>();
+  final _numberController = TextEditingController();
+  final _typeController = TextEditingController();
+  final _driverNameController = TextEditingController();
+  final _driverPhoneController = TextEditingController();
+
+  @override
+  void dispose() {
+    _numberController.dispose();
+    _typeController.dispose();
+    _driverNameController.dispose();
+    _driverPhoneController.dispose();
+    super.dispose();
+  }
+
+  void _submit() {
+    if (!_formKey.currentState!.validate()) return;
+    Navigator.pop(context, {
+      'vehicleNumber': _numberController.text.trim(),
+      'vehicleType': _typeController.text.trim(),
+      'driverName': _driverNameController.text.trim(),
+      'driverPhone': _driverPhoneController.text.trim(),
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) => AlertDialog(
+        title: const Text('Add company vehicle'),
+        content: Form(
+          key: _formKey,
+          child: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                _vehicleField(_numberController, 'Vehicle number',
+                    'Enter the plate number'),
+                _vehicleField(_typeController, 'Vehicle type', 'e.g. Truck'),
+                _vehicleField(_driverNameController, 'Driver / employee name',
+                    'Enter the assigned employee'),
+                _vehicleField(_driverPhoneController, 'Driver phone',
+                    'Enter a contact number'),
+              ],
+            ),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: _submit,
+            child: const Text('Save vehicle'),
+          ),
+        ],
+      );
+
+  Widget _vehicleField(
+    TextEditingController controller,
+    String label,
+    String hint,
+  ) =>
+      Padding(
+        padding: const EdgeInsets.only(bottom: 12),
+        child: TextFormField(
+          controller: controller,
+          decoration: InputDecoration(labelText: label, hintText: hint),
+          validator: (value) =>
+              value == null || value.trim().isEmpty ? 'Required' : null,
+        ),
+      );
 }
 
 class _PickupBadge extends StatelessWidget {

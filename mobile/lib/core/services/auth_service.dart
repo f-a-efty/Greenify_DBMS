@@ -33,6 +33,41 @@ class AuthService {
     return response.data['testCode'] as String?;
   }
 
+  Future<String?> sendPasswordResetOtp(String phone) async {
+    final response = await _dio.post('/auth/otp/send', data: {
+      'phoneNumber': phone,
+      'purpose': 'RESET',
+    });
+    return response.data['testCode'] as String?;
+  }
+
+  Future<String> verifyPasswordResetOtp(String phone, String code) async {
+    final response = await _dio.post('/auth/otp/verify', data: {
+      'phoneNumber': phone,
+      'code': code,
+      'purpose': 'RESET',
+    });
+    final token = response.data['resetToken'] as String?;
+    if (response.data['verified'] != true || token == null || token.isEmpty) {
+      throw const FormatException('Password reset verification failed.');
+    }
+    return token;
+  }
+
+  Future<void> resetPassword({
+    required String phone,
+    required String resetToken,
+    required String password,
+    required String confirmPassword,
+  }) async {
+    await _dio.post('/auth/password/reset', data: {
+      'phoneNumber': phone,
+      'resetToken': resetToken,
+      'password': password,
+      'confirmPassword': confirmPassword,
+    });
+  }
+
   Future<Map<String, dynamic>> registerUser({
     required String fullName,
     required String phoneNumber,
@@ -368,9 +403,15 @@ class AuthService {
   }
 
   Future<void> completeCompanyPickup(String? token, int requestId,
-      {String plasticGrade = 'PET 100% Sorted'}) async {
+      {double? collectedWeightKg,
+      String plasticGrade = 'PET 100% Sorted'}) async {
     await _dio.post('/company/pickup-requests/$requestId/complete',
-        data: {'plasticGrade': plasticGrade}, options: _adminOptions(token));
+        data: {
+          if (collectedWeightKg != null)
+            'collectedWeightKg': collectedWeightKg,
+          'plasticGrade': plasticGrade,
+        },
+        options: _adminOptions(token));
   }
 
   Future<List<dynamic>> fetchCompanyCollections(String? token) async {

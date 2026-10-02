@@ -10,6 +10,7 @@ Base URL: `http://127.0.0.1:8000/api/v1`. Responses are JSON. Protected routes r
 
 - `POST /auth/otp/send`: `{ "phoneNumber": "+8801711111111", "purpose": "REGISTER" }`. Development OTP is `123456`.
 - `POST /auth/otp/verify`: `{ "phoneNumber": "+8801711111111", "code": "123456", "purpose": "REGISTER" }`.
+- Password reset uses `POST /auth/otp/send` and `POST /auth/otp/verify` with `"purpose": "RESET"`, followed by `POST /auth/password/reset` with the returned `resetToken`, `phoneNumber`, `password`, and `confirmPassword`. Reset codes and tokens expire after 10 minutes and can only be used once.
 - `POST /auth/register/user`: requires `fullName`, `phoneNumber`, `password`, `confirmPassword`, and `otpCode`; returns access and refresh tokens.
 - `POST /auth/register/company`: creates a company account pending admin approval.
 - `POST /auth/login`: `{ "username": "+8801711111111", "password": "..." }`.
@@ -32,13 +33,13 @@ Base URL: `http://127.0.0.1:8000/api/v1`. Responses are JSON. Protected routes r
 Company bearer token required. Registration remains pending until an administrator approves it.
 
 - `GET /company/dashboard`, `GET /company/booths`, `GET /company/collections`, `GET /company/alerts`.
-- `POST /company/booths/{id}/pickup-requests`: dispatches an assigned booth that has plastic ready for collection.
+- When a user deposit fills a booth assigned to an approved company, the API automatically creates one high-priority pending pickup request and notifies the company. The pickup list also reconciles already-full booths that do not yet have an active request. The recycler can use `POST /company/booths/{id}/pickup-requests` to request pickup before a booth is full.
 - `GET /company/pickup-requests?status=Pending`.
 - `POST /company/pickup-requests/{id}/accept`.
 - `POST /company/pickup-requests/{id}/assign-vehicle`: `{ "vehicleId": 1 }`.
-- `POST /company/pickup-requests/{id}/complete`: `{ "plasticGrade": "PET 100% Sorted" }`.
+- `POST /company/pickup-requests/{id}/complete`: `{ "plasticGrade": "PET 100% Sorted" }` records a full collection of the booth's current weight; an optional `collectedWeightKg` may be supplied for a partial collection. The operation updates the booth weight and status, returns the assigned vehicle to the available fleet, and writes the collection to company and admin history.
 - `POST /company/alerts/{id}/read`.
-- `GET /company/vehicles`, `POST /company/vehicles`: requires `vehicleNumber`, `vehicleType`, `driverName`, and `driverPhone`.
+- `GET /company/vehicles`, `POST /company/vehicles`: requires `vehicleNumber`, `vehicleType`, `driverName`, and `driverPhone`. Available vehicles can be assigned to a pickup; the associated driver is recorded in collection history.
 
 ## Administration
 

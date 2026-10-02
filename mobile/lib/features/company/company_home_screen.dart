@@ -54,10 +54,7 @@ class _CompanyHomeScreenState extends ConsumerState<CompanyHomeScreen> {
           ),
         ],
       ),
-      body: IndexedStack(
-        index: _currentIndex,
-        children: _tabs,
-      ),
+      body: _tabs[_currentIndex],
       bottomNavigationBar: BottomNavigationBar(
         currentIndex: _currentIndex,
         onTap: (index) => setState(() => _currentIndex = index),
@@ -72,7 +69,7 @@ class _CompanyHomeScreenState extends ConsumerState<CompanyHomeScreen> {
           BottomNavigationBarItem(
               icon: Icon(Icons.local_shipping_rounded), label: 'Pickups'),
           BottomNavigationBarItem(
-              icon: Icon(Icons.history_rounded), label: 'History'),
+              icon: Icon(Icons.inventory_2_outlined), label: 'Collection'),
           BottomNavigationBarItem(
               icon: Icon(Icons.notifications_rounded), label: 'Alerts'),
         ],

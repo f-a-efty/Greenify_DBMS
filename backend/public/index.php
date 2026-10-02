@@ -4,7 +4,7 @@ declare(strict_types=1);
 header('Content-Type: application/json; charset=utf-8');
 header('Access-Control-Allow-Origin: *');
 header('Access-Control-Allow-Headers: Authorization, Content-Type, Idempotency-Key');
-header('Access-Control-Allow-Methods: GET, POST, OPTIONS');
+header('Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS');
 
 if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
     http_response_code(204);
@@ -149,6 +149,46 @@ function notify_company(PDO $db, int $companyId, string $title, string $message,
     $query->execute([$companyId, $title, $message, $category]);
 }
 
+function create_full_booth_pickup(
+    PDO $db,
+    int $boothId,
+    ?int $companyId,
+    string $boothCode,
+    float $weightKg,
+    string $boothStatus
+): ?string {
+    if ($companyId === null || $weightKg <= 0 || $boothStatus !== 'Full') {
+        return null;
+    }
+
+    $query = $db->prepare(
+        'SELECT request_code FROM pickup_requests
+         WHERE booth_id = ? AND status IN (\'Pending\', \'Accepted\', \'Vehicle Assigned\', \'On Pickup\')
+         LIMIT 1 FOR UPDATE'
+    );
+    $query->execute([$boothId]);
+    if ($query->fetchColumn() !== false) {
+        return null;
+    }
+
+    $safeBoothCode = preg_replace('/[^A-Za-z0-9-]/', '', $boothCode);
+    $requestCode = 'REQ-' . $safeBoothCode . '-' . strtoupper(bin2hex(random_bytes(2)));
+    $query = $db->prepare(
+        'INSERT INTO pickup_requests (request_code, booth_id, company_id, priority, status, payload_kg_at_request)
+         VALUES (?, ?, ?, \'HIGH\', \'Pending\', ?)'
+    );
+    $query->execute([$requestCode, $boothId, $companyId, $weightKg]);
+    notify_company(
+        $db,
+        $companyId,
+        'Full booth pickup requested',
+        $requestCode . ' is ready for collection at ' . $boothCode . '.',
+        'Pickup'
+    );
+
+    return $requestCode;
+}
+
 try {
     $path = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH) ?: '/';
     $path = preg_replace('#^/api/v1#', '', $path) ?: '/';
@@ -167,18 +207,129 @@ try {
 
     if ($path === '/auth/otp/send' && $method === 'POST') {
         $body = request_body();
-        if (empty($body['phoneNumber'])) {
+        $phone = trim((string) ($body['phoneNumber'] ?? ''));
+        $purpose = (string) ($body['purpose'] ?? 'REGISTER');
+        if ($phone === '') {
             fail(400, 'Phone number is required.');
         }
-        respond(200, ['success' => true, 'message' => 'OTP verification code dispatched.', 'testCode' => '123456']);
+        if (!in_array($purpose, ['REGISTER', 'RESET'], true)) {
+            fail(400, 'Invalid OTP purpose.');
+        }
+
+        $canSend = true;
+        if ($purpose === 'RESET') {
+            $query = $db->prepare("SELECT 1 FROM users WHERE phone_number = ? AND role IN ('USER', 'COMPANY') AND status = 'ACTIVE'");
+            $query->execute([$phone]);
+            $canSend = (bool) $query->fetchColumn();
+        }
+        if ($canSend) {
+            $query = $db->prepare(
+                'UPDATE otp_codes SET consumed = 1 WHERE phone_number = ? AND purpose = ? AND consumed = 0'
+            );
+            $query->execute([$phone, $purpose]);
+            $query = $db->prepare(
+                'INSERT INTO otp_codes (phone_number, code_hash, purpose, expires_at)
+                 VALUES (?, ?, ?, DATE_ADD(CURRENT_TIMESTAMP, INTERVAL 10 MINUTE))'
+            );
+            $query->execute([$phone, password_hash('123456', PASSWORD_DEFAULT), $purpose]);
+        }
+        respond(200, [
+            'success' => true,
+            'message' => 'OTP verification code dispatched.',
+            'testCode' => '123456',
+        ]);
     }
 
     if ($path === '/auth/otp/verify' && $method === 'POST') {
         $body = request_body();
-        if (($body['code'] ?? '') !== '123456') {
+        $phone = trim((string) ($body['phoneNumber'] ?? ''));
+        $purpose = (string) ($body['purpose'] ?? 'REGISTER');
+        $code = trim((string) ($body['code'] ?? ''));
+        if ($phone === '' || !in_array($purpose, ['REGISTER', 'RESET'], true)) {
+            fail(400, 'Phone number and valid OTP purpose are required.');
+        }
+        $query = $db->prepare(
+            'SELECT otp_id, code_hash, attempts FROM otp_codes
+             WHERE phone_number = ? AND purpose = ? AND consumed = 0
+               AND expires_at > CURRENT_TIMESTAMP AND attempts < 5
+             ORDER BY created_at DESC, otp_id DESC LIMIT 1'
+        );
+        $query->execute([$phone, $purpose]);
+        $otp = $query->fetch();
+        if (!$otp || !password_verify($code, $otp['code_hash'])) {
+            if ($otp) {
+                $query = $db->prepare('UPDATE otp_codes SET attempts = attempts + 1 WHERE otp_id = ?');
+                $query->execute([$otp['otp_id']]);
+            }
             fail(400, 'Invalid OTP code.');
         }
-        respond(200, ['verified' => true, 'resetToken' => bin2hex(random_bytes(24))]);
+        $query = $db->prepare('UPDATE otp_codes SET consumed = 1 WHERE otp_id = ?');
+        $query->execute([$otp['otp_id']]);
+
+        $response = ['verified' => true];
+        if ($purpose === 'RESET') {
+            $resetToken = bin2hex(random_bytes(32));
+            $query = $db->prepare(
+                'INSERT INTO otp_codes (phone_number, code_hash, purpose, expires_at)
+                 VALUES (?, ?, \'RESET\', DATE_ADD(CURRENT_TIMESTAMP, INTERVAL 10 MINUTE))'
+            );
+            $query->execute([$phone, password_hash($resetToken, PASSWORD_DEFAULT)]);
+            $response['resetToken'] = $resetToken;
+        }
+        respond(200, $response);
+    }
+
+    if ($path === '/auth/password/reset' && $method === 'POST') {
+        $body = request_body();
+        $phone = trim((string) ($body['phoneNumber'] ?? ''));
+        $resetToken = (string) ($body['resetToken'] ?? '');
+        $password = (string) ($body['password'] ?? '');
+        $confirmPassword = (string) ($body['confirmPassword'] ?? '');
+        if ($phone === '' || $resetToken === '' || $password === '' || $confirmPassword === '') {
+            fail(400, 'Phone number, reset token, and both password fields are required.');
+        }
+        if (!hash_equals($password, $confirmPassword)) {
+            fail(400, 'Passwords do not match.');
+        }
+        if (strlen($password) < 8) {
+            fail(400, 'Password must be at least 8 characters long.');
+        }
+
+        $db->beginTransaction();
+        try {
+            $query = $db->prepare(
+                'SELECT otp_id, code_hash FROM otp_codes
+                 WHERE phone_number = ? AND purpose = \'RESET\' AND consumed = 0
+                   AND expires_at > CURRENT_TIMESTAMP
+                 ORDER BY created_at DESC, otp_id DESC LIMIT 1 FOR UPDATE'
+            );
+            $query->execute([$phone]);
+            $reset = $query->fetch();
+            if (!$reset || !password_verify($resetToken, $reset['code_hash'])) {
+                $db->rollBack();
+                fail(400, 'Password reset verification has expired. Please request a new code.');
+            }
+
+            $query = $db->prepare(
+                "UPDATE users SET password_hash = ? WHERE phone_number = ? AND role IN ('USER', 'COMPANY') AND status = 'ACTIVE'"
+            );
+            $query->execute([password_hash($password, PASSWORD_DEFAULT), $phone]);
+            if ($query->rowCount() !== 1) {
+                $db->rollBack();
+                fail(404, 'Account not found or inactive.');
+            }
+            $query = $db->prepare('UPDATE otp_codes SET consumed = 1 WHERE otp_id = ?');
+            $query->execute([$reset['otp_id']]);
+            $query = $db->prepare('UPDATE refresh_tokens SET revoked = 1 WHERE user_id = (SELECT user_id FROM users WHERE phone_number = ?)');
+            $query->execute([$phone]);
+            $db->commit();
+        } catch (Throwable $exception) {
+            if ($db->inTransaction()) {
+                $db->rollBack();
+            }
+            throw $exception;
+        }
+        respond(200, ['success' => true, 'message' => 'Password updated successfully.']);
     }
 
     if ($path === '/auth/register/user' && $method === 'POST') {
@@ -394,6 +545,14 @@ try {
             $status = $fill >= 100 ? 'Full' : ($fill >= config_value($db, 'almost_full_threshold_pct', 80) ? 'Almost Full' : 'Available');
             $query = $db->prepare('UPDATE smart_booths SET current_weight_kg = ?, booth_status = ? WHERE booth_id = ?');
             $query->execute([$newWeight, $status, $booth['booth_id']]);
+            create_full_booth_pickup(
+                $db,
+                (int) $booth['booth_id'],
+                $booth['company_id'] === null ? null : (int) $booth['company_id'],
+                (string) $booth['booth_code'],
+                $newWeight,
+                $status
+            );
 
             $balance = (int) $lockedUser['total_tokens'] + $tokensEarned;
             $query = $db->prepare('UPDATE users SET total_tokens = ? WHERE user_id = ?');
@@ -635,20 +794,14 @@ try {
             );
             $query->execute([$user['user_id'], $tokensEarned, $balance]);
 
-            if (in_array($boothStatus, ['Almost Full', 'Full'], true) && $booth['company_id'] !== null) {
-                $query = $db->prepare(
-                    'SELECT COUNT(*) FROM pickup_requests WHERE booth_id = ? AND status IN (\'Pending\', \'Accepted\', \'Vehicle Assigned\', \'On Pickup\')'
-                );
-                $query->execute([$boothId]);
-                if ((int) $query->fetchColumn() === 0) {
-                    $requestCode = 'REQ-' . substr((string) $booth['booth_code'], 4) . '-' . strtoupper(bin2hex(random_bytes(2)));
-                    $query = $db->prepare(
-                        'INSERT INTO pickup_requests (request_code, booth_id, company_id, priority, status, payload_kg_at_request)
-                         VALUES (?, ?, ?, ?, \'Pending\', ?)'
-                    );
-                    $query->execute([$requestCode, $boothId, $booth['company_id'], $boothStatus === 'Full' ? 'HIGH' : 'NORMAL', $newWeight]);
-                }
-            }
+            create_full_booth_pickup(
+                $db,
+                $boothId,
+                $booth['company_id'] === null ? null : (int) $booth['company_id'],
+                (string) $booth['booth_code'],
+                $newWeight,
+                $boothStatus
+            );
             $db->commit();
             respond(201, [
                 'depositId' => $depositId,
@@ -895,14 +1048,45 @@ try {
 
         if ($path === '/company/pickup-requests' && $method === 'GET') {
             $status = trim((string) ($_GET['status'] ?? ''));
+            $db->beginTransaction();
+            try {
+                $query = $db->prepare(
+                    'SELECT booth_id, booth_code, current_weight_kg
+                     FROM smart_booths
+                     WHERE company_id = ? AND booth_status = \'Full\' AND current_weight_kg > 0
+                     FOR UPDATE'
+                );
+                $query->execute([$companyId]);
+                foreach ($query->fetchAll() as $fullBooth) {
+                    create_full_booth_pickup(
+                        $db,
+                        (int) $fullBooth['booth_id'],
+                        $companyId,
+                        (string) $fullBooth['booth_code'],
+                        (float) $fullBooth['current_weight_kg'],
+                        'Full'
+                    );
+                }
+                $db->commit();
+            } catch (Throwable $exception) {
+                if ($db->inTransaction()) {
+                    $db->rollBack();
+                }
+                throw $exception;
+            }
+
             $sql = 'SELECT p.request_id AS requestId, p.request_code AS requestCode, p.status, p.priority,
                            p.payload_kg_at_request AS payloadKg, p.vehicle_id AS vehicleId,
-                           p.created_at AS createdAt, p.completed_at AS completedAt,
+                           p.created_at AS createdAt, p.accepted_at AS assignedAt,
+                           p.completed_at AS completedAt,
                            b.booth_code AS boothCode,
                            b.location_address AS locationAddress, b.booth_status AS boothStatus,
-                           v.vehicle_number AS vehicleNumber
+                           b.current_weight_kg AS currentWeightKg,
+                           v.vehicle_number AS vehicleNumber, v.driver_name AS driverName,
+                           cl.net_weight_kg AS collectedKg
                     FROM pickup_requests p JOIN smart_booths b ON b.booth_id = p.booth_id
                     LEFT JOIN vehicles v ON v.vehicle_id = p.vehicle_id
+                    LEFT JOIN collections cl ON cl.pickup_request_id = p.request_id
                     WHERE p.company_id = ?';
             $params = [$companyId];
             if ($status !== '') {
@@ -916,6 +1100,8 @@ try {
             foreach ($pickups as &$pickup) {
                 $pickup['requestId'] = (int) $pickup['requestId'];
                 $pickup['payloadKg'] = (float) $pickup['payloadKg'];
+                $pickup['currentWeightKg'] = (float) $pickup['currentWeightKg'];
+                $pickup['collectedKg'] = $pickup['collectedKg'] === null ? null : (float) $pickup['collectedKg'];
                 $pickup['vehicleId'] = $pickup['vehicleId'] === null ? null : (int) $pickup['vehicleId'];
             }
             unset($pickup);
@@ -938,14 +1124,31 @@ try {
         if (preg_match('#^/company/pickup-requests/(\d+)/assign-vehicle$#', $path, $matches) && $method === 'POST') {
             $body = request_body();
             $vehicleId = (int) ($body['vehicleId'] ?? 0);
-            $query = $db->prepare('SELECT vehicle_id FROM vehicles WHERE vehicle_id = ? AND company_id = ? AND status = \'Available\'');
-            $query->execute([$vehicleId, $companyId]);
-            if ($query->fetchColumn() === false) {
-                fail(400, 'Available company vehicle not found.');
-            }
             $db->beginTransaction();
             $query = $db->prepare(
-                'UPDATE pickup_requests SET vehicle_id = ?, status = \'Vehicle Assigned\' WHERE request_id = ? AND company_id = ? AND status IN (\'Accepted\', \'Pending\')'
+                'SELECT request_id FROM pickup_requests
+                 WHERE request_id = ? AND company_id = ? AND status IN (\'Accepted\', \'Pending\')
+                 FOR UPDATE'
+            );
+            $query->execute([(int) $matches[1], $companyId]);
+            if ($query->fetchColumn() === false) {
+                $db->rollBack();
+                fail(404, 'Pickup request cannot be assigned.');
+            }
+            $query = $db->prepare(
+                'SELECT vehicle_id FROM vehicles
+                 WHERE vehicle_id = ? AND company_id = ? AND status = \'Available\' FOR UPDATE'
+            );
+            $query->execute([$vehicleId, $companyId]);
+            if ($query->fetchColumn() === false) {
+                $db->rollBack();
+                fail(400, 'Available company vehicle not found.');
+            }
+            $query = $db->prepare(
+                'UPDATE pickup_requests
+                 SET vehicle_id = ?, status = \'Vehicle Assigned\',
+                     accepted_at = COALESCE(accepted_at, CURRENT_TIMESTAMP)
+                 WHERE request_id = ? AND company_id = ? AND status IN (\'Accepted\', \'Pending\')'
             );
             $query->execute([$vehicleId, (int) $matches[1], $companyId]);
             if ($query->rowCount() !== 1) {
@@ -962,33 +1165,92 @@ try {
 
         if (preg_match('#^/company/pickup-requests/(\d+)/complete$#', $path, $matches) && $method === 'POST') {
             $body = request_body();
+            $requestedWeight = array_key_exists('collectedWeightKg', $body)
+                ? filter_var($body['collectedWeightKg'], FILTER_VALIDATE_FLOAT)
+                : null;
+            if (array_key_exists('collectedWeightKg', $body)
+                && ($requestedWeight === false || $requestedWeight <= 0)) {
+                fail(400, 'Collected weight must be greater than zero.');
+            }
             $db->beginTransaction();
             $query = $db->prepare('SELECT * FROM pickup_requests WHERE request_id = ? AND company_id = ? FOR UPDATE');
             $query->execute([(int) $matches[1], $companyId]);
             $pickup = $query->fetch();
-            if (!$pickup || $pickup['status'] === 'Completed') {
+            if (!$pickup || $pickup['status'] !== 'Vehicle Assigned' || $pickup['vehicle_id'] === null) {
                 $db->rollBack();
-                fail(404, 'Open pickup request not found.');
+                fail(409, 'Assign a vehicle to this open pickup before completing collection.');
             }
-            $query = $db->prepare('SELECT current_weight_kg FROM smart_booths WHERE booth_id = ? FOR UPDATE');
-            $query->execute([$pickup['booth_id']]);
-            $weight = (float) $query->fetchColumn();
+            $query = $db->prepare(
+                'SELECT current_weight_kg, capacity_kg, booth_status FROM smart_booths WHERE booth_id = ? AND company_id = ? FOR UPDATE'
+            );
+            $query->execute([$pickup['booth_id'], $companyId]);
+            $booth = $query->fetch();
+            if (!$booth) {
+                $db->rollBack();
+                fail(404, 'Assigned booth not found.');
+            }
+            $currentWeight = (float) $booth['current_weight_kg'];
+            $collectedWeight = round($requestedWeight === null ? $currentWeight : (float) $requestedWeight, 3);
+            if ($collectedWeight <= 0) {
+                $db->rollBack();
+                fail(400, 'Collected weight must be at least 0.001 kg.');
+            }
+            if ($collectedWeight > $currentWeight + 0.0005) {
+                $db->rollBack();
+                fail(400, 'Collected weight cannot exceed the plastic currently in the booth.');
+            }
+            $remainingWeight = round(max(0, $currentWeight - $collectedWeight), 3);
+            $fillPercentage = (float) $booth['capacity_kg'] > 0
+                ? ($remainingWeight / (float) $booth['capacity_kg']) * 100
+                : 0;
+            $boothStatus = $booth['booth_status'] === 'Under Maintenance'
+                ? 'Under Maintenance'
+                : ($remainingWeight <= 0
+                    ? 'Empty'
+                    : ($fillPercentage >= 100
+                        ? 'Full'
+                        : ($fillPercentage >= config_value($db, 'almost_full_threshold_pct', 80)
+                            ? 'Almost Full'
+                            : 'Available')));
+            $query = $db->prepare(
+                'SELECT vehicle_id FROM vehicles WHERE vehicle_id = ? AND company_id = ? AND status = \'Assigned\' FOR UPDATE'
+            );
+            $query->execute([$pickup['vehicle_id'], $companyId]);
+            if ($query->fetchColumn() === false) {
+                $db->rollBack();
+                fail(409, 'The vehicle assigned to this pickup is no longer available.');
+            }
             $query = $db->prepare(
                 'INSERT INTO collections (pickup_request_id, booth_id, company_id, net_weight_kg, plastic_grade) VALUES (?, ?, ?, ?, ?)'
             );
-            $query->execute([$pickup['request_id'], $pickup['booth_id'], $companyId, $weight, $body['plasticGrade'] ?? 'PET 100% Sorted']);
+            $query->execute([
+                $pickup['request_id'],
+                $pickup['booth_id'],
+                $companyId,
+                $collectedWeight,
+                trim((string) ($body['plasticGrade'] ?? 'PET 100% Sorted')),
+            ]);
             $collectionId = (int) $db->lastInsertId();
             $query = $db->prepare(
-                'UPDATE smart_booths SET current_weight_kg = 0, booth_status = \'Empty\', last_pickup_date = CURRENT_TIMESTAMP WHERE booth_id = ?'
+                'UPDATE smart_booths SET current_weight_kg = ?, booth_status = ?, last_pickup_date = CURRENT_TIMESTAMP WHERE booth_id = ?'
             );
-            $query->execute([$pickup['booth_id']]);
-            $query = $db->prepare('UPDATE pickup_requests SET status = \'Completed\', completed_at = CURRENT_TIMESTAMP WHERE request_id = ?');
+            $query->execute([$remainingWeight, $boothStatus, $pickup['booth_id']]);
+            $query = $db->prepare('UPDATE pickup_requests SET status = \'Completed\', completed_at = CURRENT_TIMESTAMP WHERE request_id = ? AND status = \'Vehicle Assigned\'');
             $query->execute([$pickup['request_id']]);
-            if ($pickup['vehicle_id'] !== null) {
-                $query = $db->prepare('UPDATE vehicles SET status = \'Available\' WHERE vehicle_id = ?');
-                $query->execute([$pickup['vehicle_id']]);
+            if ($query->rowCount() !== 1) {
+                $db->rollBack();
+                fail(409, 'Pickup request was already completed.');
             }
-            notify_company($db, $companyId, 'Pickup completed', $pickup['request_code'] . ' was collected successfully.', 'Collection');
+            $query = $db->prepare('UPDATE vehicles SET status = \'Available\' WHERE vehicle_id = ? AND company_id = ?');
+            $query->execute([$pickup['vehicle_id'], $companyId]);
+            notify_company(
+                $db,
+                $companyId,
+                'Pickup completed',
+                $pickup['request_code'] . ' collected ' . number_format($collectedWeight, 3) . ' kg. ' .
+                    number_format($remainingWeight, 3) . ' kg remains at the booth.',
+                'Collection'
+            );
             $db->commit();
             $query = $db->prepare('SELECT * FROM collections WHERE collection_id = ?');
             $query->execute([$collectionId]);
@@ -996,7 +1258,12 @@ try {
         }
 
         if ($path === '/company/vehicles' && $method === 'GET') {
-            $query = $db->prepare('SELECT * FROM vehicles WHERE company_id = ? ORDER BY vehicle_id');
+            $query = $db->prepare(
+                'SELECT vehicle_id AS vehicleId, vehicle_number AS vehicleNumber,
+                        vehicle_type AS vehicleType, driver_name AS driverName,
+                        driver_phone AS driverPhone, status
+                 FROM vehicles WHERE company_id = ? ORDER BY vehicle_id'
+            );
             $query->execute([$companyId]);
             respond(200, $query->fetchAll());
         }
@@ -1013,8 +1280,13 @@ try {
             );
             $query->execute([$companyId, $body['vehicleNumber'], $body['vehicleType'], $body['driverName'], $body['driverPhone']]);
             $vehicleId = (int) $db->lastInsertId();
-            $query = $db->prepare('SELECT * FROM vehicles WHERE vehicle_id = ?');
-            $query->execute([$vehicleId]);
+            $query = $db->prepare(
+                'SELECT vehicle_id AS vehicleId, vehicle_number AS vehicleNumber,
+                        vehicle_type AS vehicleType, driver_name AS driverName,
+                        driver_phone AS driverPhone, status
+                 FROM vehicles WHERE vehicle_id = ? AND company_id = ?'
+            );
+            $query->execute([$vehicleId, $companyId]);
             respond(201, $query->fetch());
         }
 
@@ -1023,9 +1295,11 @@ try {
                 'SELECT cl.collection_id AS collectionId, cl.pickup_request_id AS pickupRequestId,
                         pr.request_code AS requestCode, b.booth_code AS boothCode,
                         b.location_address AS locationAddress, cl.net_weight_kg AS netWeightKg,
-                        cl.plastic_grade AS plasticGrade, cl.collected_at AS collectedAt
+                        cl.plastic_grade AS plasticGrade, cl.collected_at AS collectedAt,
+                        v.vehicle_number AS vehicleNumber, v.driver_name AS driverName
                  FROM collections cl JOIN pickup_requests pr ON pr.request_id = cl.pickup_request_id
                  JOIN smart_booths b ON b.booth_id = cl.booth_id
+                 LEFT JOIN vehicles v ON v.vehicle_id = pr.vehicle_id
                  WHERE cl.company_id = ? ORDER BY cl.collected_at DESC'
             );
             $query->execute([$companyId]);
@@ -1212,33 +1486,61 @@ try {
         if (preg_match('#^/admin/booths/(\d+)$#', $path, $matches) && $method === 'PUT') {
             $body = request_body();
             $boothId = (int) $matches[1];
-            $query = $db->prepare('SELECT company_id, booth_code FROM smart_booths WHERE booth_id = ?');
-            $query->execute([$boothId]);
-            $currentBooth = $query->fetch();
-            if (!$currentBooth) {
-                fail(404, 'Booth not found.');
-            }
-            $companyId = !empty($body['companyId']) ? (int) $body['companyId'] : null;
-            if ($companyId !== null) {
-                $query = $db->prepare('SELECT 1 FROM recycling_companies WHERE company_id = ? AND status = \'ACTIVE\'');
-                $query->execute([$companyId]);
-                if (!$query->fetchColumn()) {
-                    fail(400, 'Booths can only be assigned to approved companies.');
+            $db->beginTransaction();
+            try {
+                $query = $db->prepare(
+                    'SELECT company_id, booth_code, current_weight_kg FROM smart_booths WHERE booth_id = ? FOR UPDATE'
+                );
+                $query->execute([$boothId]);
+                $currentBooth = $query->fetch();
+                if (!$currentBooth) {
+                    $db->rollBack();
+                    fail(404, 'Booth not found.');
                 }
-            }
-            $query = $db->prepare(
-                'UPDATE smart_booths SET booth_code = ?, location_address = ?, capacity_kg = ?, company_id = ?, booth_status = ? WHERE booth_id = ?'
-            );
-            $query->execute([
-                trim((string) ($body['boothCode'] ?? '')),
-                trim((string) ($body['locationAddress'] ?? '')),
-                max(0.001, (float) ($body['capacityKg'] ?? 100)),
-                $companyId,
-                trim((string) ($body['boothStatus'] ?? 'Available')),
-                $boothId,
-            ]);
-            if ($companyId !== null && (int) ($currentBooth['company_id'] ?? 0) !== $companyId) {
-                notify_company($db, $companyId, 'Booth assigned', $body['boothCode'] . ' is now assigned to your company.', 'Booth');
+                $companyId = !empty($body['companyId']) ? (int) $body['companyId'] : null;
+                if ($companyId !== null) {
+                    $query = $db->prepare('SELECT 1 FROM recycling_companies WHERE company_id = ? AND status = \'ACTIVE\'');
+                    $query->execute([$companyId]);
+                    if (!$query->fetchColumn()) {
+                        $db->rollBack();
+                        fail(400, 'Booths can only be assigned to approved companies.');
+                    }
+                }
+                $boothCode = trim((string) ($body['boothCode'] ?? ''));
+                $capacity = max(0.001, (float) ($body['capacityKg'] ?? 100));
+                $currentWeight = (float) $currentBooth['current_weight_kg'];
+                $requestedStatus = trim((string) ($body['boothStatus'] ?? 'Available'));
+                $boothStatus = $requestedStatus === 'Under Maintenance'
+                    ? 'Under Maintenance'
+                    : ($currentWeight >= $capacity ? 'Full' : $requestedStatus);
+                $query = $db->prepare(
+                    'UPDATE smart_booths SET booth_code = ?, location_address = ?, capacity_kg = ?, company_id = ?, booth_status = ? WHERE booth_id = ?'
+                );
+                $query->execute([
+                    $boothCode,
+                    trim((string) ($body['locationAddress'] ?? '')),
+                    $capacity,
+                    $companyId,
+                    $boothStatus,
+                    $boothId,
+                ]);
+                if ($companyId !== null && (int) ($currentBooth['company_id'] ?? 0) !== $companyId) {
+                    notify_company($db, $companyId, 'Booth assigned', $boothCode . ' is now assigned to your company.', 'Booth');
+                }
+                create_full_booth_pickup(
+                    $db,
+                    $boothId,
+                    $companyId,
+                    $boothCode,
+                    $currentWeight,
+                    $boothStatus
+                );
+                $db->commit();
+            } catch (Throwable $exception) {
+                if ($db->inTransaction()) {
+                    $db->rollBack();
+                }
+                throw $exception;
             }
             respond(200, ['success' => true]);
         }
