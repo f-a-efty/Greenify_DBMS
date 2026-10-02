@@ -1,8 +1,1 @@
-Project show -- October 5, 2026
-Last date to complete the project -- September 25, 2026
-
-September 9 -- Design UI
-September 13 -- Make Frontend + Concider about backend
-September 16 -- Design Backend
-September 20 --  Make Backend
-September 25 -- Finishing Touch
+October 03, 2026 --full project update needed
